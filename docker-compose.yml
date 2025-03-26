@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  postgres_master:
+    image: postgres:15
+    container_name: postgres_master
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres  # Custom database name
+    ports:
+      - "0.0.0.0:5432:5432"
+    volumes:
+      - ./configs/pg_hba.conf:/tmp/pg_hba.conf
+      - ./archive:/var/lib/postgresql/archive
+      - ./pg_data:/var/lib/postgresql/data
+    command: >
+      postgres
+        -c "listen_addresses=*"
+        -c "wal_level=replica"
+        -c "max_wal_senders=10"
+        -c "max_replication_slots=10"
+        -c "hot_standby=on"
+        -c "archive_mode=on"
+        -c "archive_command='test ! -f /var/lib/postgresql/archive/%f && cp %p /var/lib/postgresql/archive/%f || true'"
+        -c "hba_file=/tmp/pg_hba.conf"
+    networks:
+      - postgres_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+networks:
+  postgres_network:
+    driver: bridge

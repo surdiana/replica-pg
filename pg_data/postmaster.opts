@@ -1,0 +1,1 @@
+/usr/lib/postgresql/15/bin/postgres "-c" "listen_addresses=*" "-c" "wal_level=replica" "-c" "max_wal_senders=10" "-c" "max_replication_slots=10" "-c" "hot_standby=on" "-c" "archive_mode=on" "-c" "archive_command='test ! -f /var/lib/postgresql/archive/%f && cp %p /var/lib/postgresql/archive/%f || true'" "-c" "hba_file=/tmp/pg_hba.conf"
