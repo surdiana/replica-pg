@@ -297,13 +297,43 @@ fi
 echo "Giving PostgreSQL a few more seconds to fully initialize..."
 sleep 5
 
+# Ensure custom database exists before continuing
+echo "Ensuring custom database exists..."
+attempt=0
+max_attempts=5
+
+while [ $attempt -lt $max_attempts ]; do
+  if docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -c "SELECT 1 FROM pg_database WHERE datname = '$POSTGRES_DB'" | grep -q 1; then
+    echo "✓ Database $POSTGRES_DB exists."
+    break
+  else
+    echo "Creating database $POSTGRES_DB..."
+    if docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -c "CREATE DATABASE $POSTGRES_DB;" >/dev/null 2>&1; then
+      echo "✓ Successfully created database $POSTGRES_DB."
+      break
+    fi
+  fi
+  
+  attempt=$((attempt+1))
+  echo "Failed to ensure database exists (attempt $attempt of $max_attempts). Retrying in 2 seconds..."
+  sleep 2
+done
+
+if [ $attempt -eq $max_attempts ]; then
+  echo "Warning: Failed to ensure database exists after $max_attempts attempts."
+  # Show PostgreSQL logs to help diagnose
+  echo "PostgreSQL container logs:"
+  docker logs $CONTAINER_NAME --tail 20
+  exit 1
+fi
+
 # Create replication user with more robust error handling
 echo "Creating replication user..."
 attempt=0
 max_attempts=5
 
 while [ $attempt -lt $max_attempts ]; do
-  if docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "CREATE ROLE $REPLICATION_USER WITH REPLICATION PASSWORD '$REPLICATION_PASSWORD' LOGIN;" >/dev/null 2>&1; then
+  if docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -c "CREATE ROLE $REPLICATION_USER WITH REPLICATION PASSWORD '$REPLICATION_PASSWORD' LOGIN;" >/dev/null 2>&1; then
     echo "Replication user created successfully!"
     break
   else
@@ -326,7 +356,7 @@ attempt=0
 max_attempts=5
 
 while [ $attempt -lt $max_attempts ]; do
-  if docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT pg_create_physical_replication_slot('replica_slot');" >/dev/null 2>&1; then
+  if docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "SELECT pg_create_physical_replication_slot('replica_slot');" >/dev/null 2>&1; then
     echo "Replication slot created successfully!"
     break
   else
@@ -351,18 +381,37 @@ docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT pg
 
 # Create a test table in the custom database to verify write access
 echo "Creating a test table in $POSTGRES_DB database to verify write access..."
-docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "
-CREATE TABLE IF NOT EXISTS replication_test (
-    id SERIAL PRIMARY KEY,
-    test_name VARCHAR(100) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);"
+attempt=0
+max_attempts=5
+
+while [ $attempt -lt $max_attempts ]; do
+  if docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "
+  CREATE TABLE IF NOT EXISTS replication_test (
+      id SERIAL PRIMARY KEY,
+      test_name VARCHAR(100) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );" >/dev/null 2>&1; then
+    echo "✓ Successfully created test table in $POSTGRES_DB."
+    break
+  else
+    attempt=$((attempt+1))
+    echo "Failed to create test table (attempt $attempt of $max_attempts). Retrying in 2 seconds..."
+    sleep 2
+  fi
+done
+
+if [ $attempt -eq $max_attempts ]; then
+  echo "Warning: Failed to create test table after $max_attempts attempts."
+fi
 
 docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "
 INSERT INTO replication_test (test_name) VALUES ('Initial replication test') RETURNING id;"
 
 # Display information about the custom database
 echo "Verifying custom database setup..."
+# Check if database exists, if not create it
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "SELECT 1 FROM pg_database WHERE datname = '$POSTGRES_DB'" | grep -q 1 || docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "CREATE DATABASE $POSTGRES_DB;"
+# Now verify the database exists
 docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "\l" | grep "$POSTGRES_DB"
 docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "\dt"
 

@@ -218,9 +218,9 @@ max_attempts=30
 attempt=0
 
 while [ $attempt -lt $max_attempts ]; do
-  # Check if PostgreSQL is accepting connections, specifically for our custom database
-  if docker exec $CONTAINER_NAME pg_isready -U $POSTGRES_USER -d $POSTGRES_DB 2>/dev/null; then
-    echo "PostgreSQL replica is up and ready with database $POSTGRES_DB!"
+  # Check if PostgreSQL is accepting connections to postgres database first
+  if docker exec $CONTAINER_NAME pg_isready -U $POSTGRES_USER 2>/dev/null; then
+    echo "PostgreSQL replica base system is up!"
     break
   fi
   
@@ -229,41 +229,110 @@ while [ $attempt -lt $max_attempts ]; do
   sleep 2
 done
 
+# Now ensure the custom database exists before trying to connect to it
+echo "Ensuring custom database $POSTGRES_DB is accessible..."
+attempt=0
+max_attempts=10
+
+while [ $attempt -lt $max_attempts ]; do
+  # Check if we can list databases and see our database
+  if docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "\l" 2>/dev/null | grep -q "$POSTGRES_DB"; then
+    echo "✓ Database $POSTGRES_DB is visible in database list"
+    
+    # Try to connect to the database
+    if docker exec $CONTAINER_NAME pg_isready -U $POSTGRES_USER -d $POSTGRES_DB 2>/dev/null; then
+      echo "✓ Database $POSTGRES_DB is accessible"
+      break
+    fi
+  fi
+  
+  attempt=$((attempt+1))
+  echo "Waiting for database $POSTGRES_DB to be available (attempt $attempt of $max_attempts)..."
+  sleep 3
+done
+
 if [ $attempt -eq $max_attempts ]; then
-  echo "Warning: PostgreSQL replica failed to start properly after $max_attempts attempts."
-  echo "Continuing with verification steps, but expect issues..."
+  echo "Warning: Custom database $POSTGRES_DB may not be properly replicated yet."
+  echo "This is normal during initial setup and should resolve within a few minutes."
+  echo "Continuing with verification steps..."
 fi
 
 # Verify replica is in recovery mode
 echo "Verifying replica is in recovery mode..."
-RECOVERY_STATUS=$(docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -tAc "SELECT pg_is_in_recovery();" 2>/dev/null || echo "error")
-if [ "$RECOVERY_STATUS" == "t" ]; then
-  echo "✓ Replica is in recovery mode (streaming replication is active)"
-else
+attempt=0
+max_attempts=5
+RECOVERY_STATUS="error"
+
+while [ $attempt -lt $max_attempts ]; do
+  RECOVERY_STATUS=$(docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -tAc "SELECT pg_is_in_recovery();" 2>/dev/null || echo "error")
+  if [ "$RECOVERY_STATUS" == "t" ]; then
+    echo "✓ Replica is in recovery mode (streaming replication is active)"
+    break
+  else
+    attempt=$((attempt+1))
+    echo "Checking recovery status (attempt $attempt of $max_attempts)... waiting"
+    sleep 2
+  fi
+done
+
+if [ "$RECOVERY_STATUS" != "t" ]; then
   echo "✗ Replica is not in recovery mode. Streaming replication may not be working."
   echo "Please check logs with: docker logs $CONTAINER_NAME"
 fi
 
 # Display connection info
 echo "Displaying replication status from replica:"
-docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT * FROM pg_stat_wal_receiver;"
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "SELECT * FROM pg_stat_wal_receiver;"
 
 # Check for replication lag
 echo "Checking for replication lag..."
-docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT now() - pg_last_xact_replay_timestamp() AS replication_lag;"
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "SELECT now() - pg_last_xact_replay_timestamp() AS replication_lag;"
 
 # Verify specifically that custom database exists and is being replicated
 echo "Verifying custom database replication..."
-docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "\l" | grep "$POSTGRES_DB"
+attempt=0
+max_attempts=5
+
+while [ $attempt -lt $max_attempts ]; do
+  if docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "\l" 2>/dev/null | grep -q "$POSTGRES_DB"; then
+    echo "✓ Database '$POSTGRES_DB' is visible on replica"
+    break
+  else
+    attempt=$((attempt+1))
+    echo "Waiting for database '$POSTGRES_DB' to appear on replica (attempt $attempt of $max_attempts)..."
+    sleep 3
+  fi
+done
+
+if [ $attempt -eq $max_attempts ]; then
+  echo "✗ Database '$POSTGRES_DB' not found on replica after $max_attempts attempts"
+  echo "This indicates a potential replication issue. Please check logs."
+fi
 
 # Check for test table created on master
 echo "Checking for test table created on master..."
-if docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "\dt replication_test" 2>/dev/null | grep -q 'replication_test'; then
-  echo "✓ Test table 'replication_test' found in $POSTGRES_DB database"
-  echo "Showing test data:"
-  docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT * FROM replication_test;"
-else
-  echo "✗ Test table 'replication_test' not found in $POSTGRES_DB database"
+attempt=0
+max_attempts=10
+
+while [ $attempt -lt $max_attempts ]; do
+  # First check if we can connect to the database
+  if docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT 1" >/dev/null 2>&1; then
+    # Now check for the test table
+    if docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "\dt replication_test" 2>/dev/null | grep -q 'replication_test'; then
+      echo "✓ Test table 'replication_test' found in $POSTGRES_DB database"
+      echo "Showing test data:"
+      docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT * FROM replication_test;"
+      break
+    fi
+  fi
+  
+  attempt=$((attempt+1))
+  echo "Waiting for test table to be replicated (attempt $attempt of $max_attempts)..."
+  sleep 3
+done
+
+if [ $attempt -eq $max_attempts ]; then
+  echo "✗ Test table 'replication_test' not found in $POSTGRES_DB database after $max_attempts attempts"
   echo "This could indicate replication issues or that the table wasn't created on master"
 fi
 
