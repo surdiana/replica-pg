@@ -182,7 +182,7 @@ max_wal_senders = 10
 max_replication_slots = 10
 hot_standby = on
 archive_mode = on
-archive_command = 'cp %p ${ARCHIVE_PATH}/%f'
+archive_command = 'test ! -f ${ARCHIVE_PATH}/%f && cp %p ${ARCHIVE_PATH}/%f || true'
 EOF
 
 # Check if container already exists
@@ -249,7 +249,7 @@ cat >> docker-compose.yml << EOF
         -c "max_replication_slots=10"
         -c "hot_standby=on"
         -c "archive_mode=on"
-        -c "archive_command='cp %p /var/lib/postgresql/archive/%f'"
+        -c "archive_command='test ! -f /var/lib/postgresql/archive/%f && cp %p /var/lib/postgresql/archive/%f || true'"
         -c "hba_file=/tmp/pg_hba.conf"
     networks:
       - postgres_network
@@ -303,12 +303,13 @@ attempt=0
 max_attempts=5
 
 while [ $attempt -lt $max_attempts ]; do
-  if docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -c "SELECT 1 FROM pg_database WHERE datname = '$POSTGRES_DB'" | grep -q 1; then
+  # Pastikan kita menggunakan database default postgres, bukan database kustom yang belum dibuat
+  if docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -d postgres -c "SELECT 1 FROM pg_database WHERE datname = '$POSTGRES_DB'" | grep -q 1; then
     echo "✓ Database $POSTGRES_DB exists."
     break
   else
     echo "Creating database $POSTGRES_DB..."
-    if docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -c "CREATE DATABASE $POSTGRES_DB;" >/dev/null 2>&1; then
+    if docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -d postgres -c "CREATE DATABASE $POSTGRES_DB;" >/dev/null 2>&1; then
       echo "✓ Successfully created database $POSTGRES_DB."
       break
     fi
