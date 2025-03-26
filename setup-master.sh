@@ -365,6 +365,16 @@ while [ $attempt -lt $max_attempts ]; do
     sleep 3
   fi
 done
+
+if [ $attempt -eq $max_attempts ]; then
+  echo "Warning: Failed to create replication user after $max_attempts attempts."
+  # Show PostgreSQL logs to help diagnose
+  echo "PostgreSQL container logs:"
+  docker logs $CONTAINER_NAME --tail 10
+  
+  echo "Checking if user already exists:"
+  docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -d postgres -c "SELECT rolname, rolreplication FROM pg_roles WHERE rolname='$REPLICATION_USER';" || true
+fi
     echo "Replication user created successfully!"
     break
   else
