@@ -6,6 +6,7 @@ ARCHIVE_PATH=${ARCHIVE_PATH:-./archive}
 DATA_PATH=${DATA_PATH:-./pg_data}
 POSTGRES_USER=${POSTGRES_USER:-postgres}
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+POSTGRES_DB=${POSTGRES_DB:-postgres}  # Custom database name parameter
 REPLICATION_USER=${REPLICATION_USER:-replica}
 REPLICATION_PASSWORD=${REPLICATION_PASSWORD:-replica}
 POSTGRES_VERSION=${POSTGRES_VERSION:-15}
@@ -29,6 +30,7 @@ echo "====== Initialize PostgreSQL Replication ======"
 echo "Using the following configuration:"
 echo "Container Name: $CONTAINER_NAME"
 echo "PostgreSQL Version: $POSTGRES_VERSION"
+echo "Database Name: $POSTGRES_DB"  # Display custom database name
 echo "Archive Path: $ARCHIVE_PATH"
 echo "Data Path: $DATA_PATH"
 echo "PostgreSQL User: $POSTGRES_USER"
@@ -108,6 +110,11 @@ local   all             all                                     trust
 host    all             all             127.0.0.1/32            trust
 host    all             all             ::1/128                 trust
 
+# Custom database specific entries
+local   $POSTGRES_DB    $POSTGRES_USER                          trust
+host    $POSTGRES_DB    $POSTGRES_USER  127.0.0.1/32            trust
+host    $POSTGRES_DB    $POSTGRES_USER  ::1/128                 trust
+
 # Replication connections - local
 host    replication     all             127.0.0.1/32            trust
 host    replication     all             ::1/128                 trust
@@ -120,6 +127,7 @@ for network in "${PG_HBA_ALLOWED_IPS[@]}"; do
   # Skip localhost as it's already added above
   if [ "$network" != "127.0.0.1/32" ] && [ "$network" != "::1/128" ]; then
     echo "host    all             $POSTGRES_USER      $network               md5" >> configs/pg_hba.conf
+    echo "host    $POSTGRES_DB    $POSTGRES_USER      $network               md5" >> configs/pg_hba.conf
     echo "host    replication     $REPLICATION_USER   $network               md5" >> configs/pg_hba.conf
   fi
 done
@@ -133,6 +141,7 @@ for binding in "${IP_BINDINGS[@]}"; do
   if [ "$ip" == "0.0.0.0" ] && ! echo "${PG_HBA_ALLOWED_IPS[@]}" | grep -q "0.0.0.0/0"; then
     echo "# Adding wildcard entry from IP_BINDINGS" >> configs/pg_hba.conf
     echo "host    all             $POSTGRES_USER      0.0.0.0/0               md5" >> configs/pg_hba.conf
+    echo "host    $POSTGRES_DB    $POSTGRES_USER      0.0.0.0/0               md5" >> configs/pg_hba.conf
     echo "host    replication     $REPLICATION_USER   0.0.0.0/0               md5" >> configs/pg_hba.conf
   fi
 done
@@ -214,6 +223,7 @@ services:
     environment:
       POSTGRES_USER: $POSTGRES_USER
       POSTGRES_PASSWORD: $POSTGRES_PASSWORD
+      POSTGRES_DB: $POSTGRES_DB  # Custom database name
     ports:
 EOF
 
@@ -244,7 +254,7 @@ cat >> docker-compose.yml << EOF
     networks:
       - postgres_network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $POSTGRES_USER"]
+      test: ["CMD-SHELL", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -264,11 +274,11 @@ max_attempts=30
 attempt=0
 
 while [ $attempt -lt $max_attempts ]; do
-  # Check if PostgreSQL is accepting connections
-  if docker exec $CONTAINER_NAME pg_isready -U $POSTGRES_USER; then
-    # Additional check: verify PostgreSQL is fully started by attempting a simple query
-    if docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -c "SELECT 1" >/dev/null 2>&1; then
-      echo "PostgreSQL is up and ready!"
+  # Check if PostgreSQL is accepting connections, specifically for our custom database
+  if docker exec $CONTAINER_NAME pg_isready -U $POSTGRES_USER -d $POSTGRES_DB; then
+    # Additional check: verify PostgreSQL is fully started by attempting a simple query on the custom database
+    if docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT 1" >/dev/null 2>&1; then
+      echo "PostgreSQL is up and ready with database $POSTGRES_DB!"
       break
     fi
   fi
@@ -293,7 +303,7 @@ attempt=0
 max_attempts=5
 
 while [ $attempt -lt $max_attempts ]; do
-  if docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -c "CREATE ROLE $REPLICATION_USER WITH REPLICATION PASSWORD '$REPLICATION_PASSWORD' LOGIN;" >/dev/null 2>&1; then
+  if docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "CREATE ROLE $REPLICATION_USER WITH REPLICATION PASSWORD '$REPLICATION_PASSWORD' LOGIN;" >/dev/null 2>&1; then
     echo "Replication user created successfully!"
     break
   else
@@ -316,7 +326,7 @@ attempt=0
 max_attempts=5
 
 while [ $attempt -lt $max_attempts ]; do
-  if docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "SELECT pg_create_physical_replication_slot('replica_slot');" >/dev/null 2>&1; then
+  if docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT pg_create_physical_replication_slot('replica_slot');" >/dev/null 2>&1; then
     echo "Replication slot created successfully!"
     break
   else
@@ -330,14 +340,31 @@ if [ $attempt -eq $max_attempts ]; then
   echo "Warning: Failed to create replication slot after $max_attempts attempts."
 fi
 
-# Verify configuration
+# Verify configuration - using custom database where appropriate
 echo "Verifying master configuration..."
-docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "SHOW wal_level;"
-docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "SHOW max_wal_senders;"
-docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "SHOW max_replication_slots;"
-docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "SELECT * FROM pg_replication_slots;"
-docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "SELECT * FROM pg_roles WHERE rolname='$REPLICATION_USER';"
-docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "SELECT pg_read_file(current_setting('hba_file'), 0, 1000);"
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SHOW wal_level;"
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SHOW max_wal_senders;"
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SHOW max_replication_slots;"
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT * FROM pg_replication_slots;"
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT * FROM pg_roles WHERE rolname='$REPLICATION_USER';"
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT pg_read_file(current_setting('hba_file'), 0, 1000);"
+
+# Create a test table in the custom database to verify write access
+echo "Creating a test table in $POSTGRES_DB database to verify write access..."
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "
+CREATE TABLE IF NOT EXISTS replication_test (
+    id SERIAL PRIMARY KEY,
+    test_name VARCHAR(100) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);"
+
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "
+INSERT INTO replication_test (test_name) VALUES ('Initial replication test') RETURNING id;"
+
+# Display information about the custom database
+echo "Verifying custom database setup..."
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "\l" | grep "$POSTGRES_DB"
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "\dt"
 
 # Display container IP
 echo "IP address PostgreSQL master: $(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $CONTAINER_NAME)"
@@ -346,4 +373,29 @@ echo "IP address PostgreSQL master: $(docker inspect -f '{{range .NetworkSetting
 echo "Docker port mappings:"
 docker port $CONTAINER_NAME
 
+# Additional verification steps for custom database
+echo "Testing connection to custom database with replication user..."
+docker exec $CONTAINER_NAME psql -U $REPLICATION_USER -d $POSTGRES_DB -c "SELECT current_database();" || echo "Note: Replication user might not have direct database access permissions"
+
+# Verify WAL (Write-Ahead Log) is properly configured for replication with the custom database
+echo "Verifying WAL configuration for replication..."
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "
+SELECT 
+    name,
+    setting,
+    boot_val,
+    reset_val,
+    unit
+FROM pg_settings 
+WHERE name IN ('wal_level', 'max_wal_senders', 'max_replication_slots', 'hot_standby', 'archive_mode');"
+
 echo "====== PostgreSQL Replication Setup Complete ======"
+echo "Custom database '$POSTGRES_DB' is successfully configured."
+echo "To connect to this database use the following parameters:"
+echo "  Host: <your-server-ip>"
+for binding in "${IP_BINDINGS[@]}"; do
+  port=$(echo $binding | cut -d ':' -f2)
+  echo "  Port: $port"
+done
+echo "  Database: $POSTGRES_DB"
+echo "  User: $POSTGRES_USER"

@@ -1,6 +1,6 @@
-# Pengaturan Replikasi PostgreSQL Master-Replica
+# Pengaturan Replikasi PostgreSQL Master-Replica dengan Database Kustom
 
-Repositori ini berisi skrip untuk mengatur replikasi PostgreSQL dengan node master dan replica menggunakan Docker. Pengaturan ini dirancang untuk replikasi antar-server dengan opsi konfigurasi yang fleksibel.
+Repositori ini berisi skrip untuk mengatur replikasi PostgreSQL dengan node master dan replica menggunakan Docker. Pengaturan ini dirancang untuk replikasi antar-server dengan opsi konfigurasi yang fleksibel dan mendukung nama database kustom.
 
 ## Prasyarat
 
@@ -20,6 +20,7 @@ Variabel dapat dikonfigurasi sebagai variabel lingkungan sebelum menjalankan skr
 | `DATA_PATH` | `./pg_data` | Direktori untuk file data PostgreSQL |
 | `POSTGRES_USER` | `postgres` | Pengguna utama PostgreSQL |
 | `POSTGRES_PASSWORD` | `postgres` | Kata sandi untuk pengguna utama PostgreSQL |
+| `POSTGRES_DB` | `postgres` | Nama database kustom (baru) |
 | `REPLICATION_USER` | `replica` | Pengguna untuk koneksi replikasi |
 | `REPLICATION_PASSWORD` | `replica` | Kata sandi untuk pengguna replikasi |
 | `POSTGRES_VERSION` | `15` | Versi PostgreSQL yang digunakan |
@@ -35,6 +36,7 @@ Variabel dapat dikonfigurasi sebagai variabel lingkungan sebelum menjalankan skr
 | `DATA_PATH` | `./replica_data` | Direktori untuk file data PostgreSQL |
 | `POSTGRES_USER` | `postgres` | Pengguna utama PostgreSQL |
 | `POSTGRES_PASSWORD` | `postgres` | Kata sandi untuk pengguna utama PostgreSQL |
+| `POSTGRES_DB` | `postgres` | Nama database kustom (baru) |
 | `REPLICATION_USER` | `replica` | Pengguna untuk koneksi replikasi |
 | `REPLICATION_PASSWORD` | `replica` | Kata sandi untuk pengguna replikasi |
 | `POSTGRES_VERSION` | `15` | Versi PostgreSQL yang digunakan |
@@ -42,6 +44,17 @@ Variabel dapat dikonfigurasi sebagai variabel lingkungan sebelum menjalankan skr
 | `REPLICA_PORT` | `5433` | Port untuk PostgreSQL replica |
 | `MASTER_HOST` | `192.168.2.77` | **WAJIB**: Alamat IP server master |
 | `MASTER_PORT` | `5432` | Port server PostgreSQL master |
+
+## Fitur Database Kustom
+
+Pengaturan ini mendukung penggunaan nama database kustom melalui variabel `POSTGRES_DB`. Ketika Anda mengatur variabel ini, skrip akan:
+
+1. Membuat database dengan nama yang ditentukan pada server master
+2. Mengonfigurasi hak akses yang tepat di pg_hba.conf untuk database kustom
+3. Membuat tabel uji dalam database kustom untuk memverifikasi replikasi
+4. Memastikan database kustom direplikasi ke server replica
+
+Fitur ini memungkinkan Anda untuk langsung menggunakan nama database aplikasi Anda tanpa perlu langkah tambahan setelah penyiapan.
 
 ## Instruksi Pengaturan
 
@@ -55,6 +68,7 @@ Variabel dapat dikonfigurasi sebagai variabel lingkungan sebelum menjalankan skr
 
 2. Konfigurasi variabel lingkungan jika diperlukan (atau gunakan default):
    ```
+   export POSTGRES_DB="mydatabase"  # Setel nama database kustom Anda
    export IP_BINDINGS=("192.168.2.77:5432")
    export PG_HBA_ALLOWED_IPS=("192.168.2.77/32" "ip_server_replica/32")
    ```
@@ -67,9 +81,10 @@ Variabel dapat dikonfigurasi sebagai variabel lingkungan sebelum menjalankan skr
    ./setup-master.sh
    ```
 
-4. Verifikasi pengaturan master:
+4. Verifikasi pengaturan master dan database kustom:
    ```
    docker logs postgres_master
+   docker exec postgres_master psql -U postgres -c "\l" | grep mydatabase
    ```
 
 5. Catat alamat IP master untuk digunakan dalam pengaturan replica.
@@ -82,10 +97,11 @@ Variabel dapat dikonfigurasi sebagai variabel lingkungan sebelum menjalankan skr
    cd replica-pg
    ```
 
-2. Konfigurasi variabel lingkungan, pastikan untuk mengatur IP server master:
+2. Konfigurasi variabel lingkungan, pastikan untuk mengatur IP server master dan nama database yang sama:
    ```
    export MASTER_HOST=192.168.2.77  # Ganti dengan IP master yang sebenarnya
    export MASTER_PORT=5432
+   export POSTGRES_DB="mydatabase"  # HARUS SAMA dengan yang diatur di master
    ```
 
 3. Jalankan skrip pengaturan replica:
@@ -97,6 +113,7 @@ Variabel dapat dikonfigurasi sebagai variabel lingkungan sebelum menjalankan skr
 4. Verifikasi pengaturan replica dan status replikasi:
    ```
    docker logs postgres_replica
+   docker exec postgres_replica psql -U postgres -c "\l" | grep mydatabase
    ```
 
 ## Verifikasi
@@ -105,34 +122,38 @@ Variabel dapat dikonfigurasi sebagai variabel lingkungan sebelum menjalankan skr
 
 Periksa slot replikasi dan replica yang terhubung:
 ```
-docker exec postgres_master psql -U postgres -c "SELECT * FROM pg_replication_slots;"
-docker exec postgres_master psql -U postgres -c "SELECT * FROM pg_stat_replication;"
+docker exec postgres_master psql -U postgres -d $POSTGRES_DB -c "SELECT * FROM pg_replication_slots;"
+docker exec postgres_master psql -U postgres -d $POSTGRES_DB -c "SELECT * FROM pg_stat_replication;"
+```
+
+Periksa tabel uji yang dibuat otomatis:
+```
+docker exec postgres_master psql -U postgres -d $POSTGRES_DB -c "SELECT * FROM replication_test;"
 ```
 
 ### Di Replica
 
 Verifikasi bahwa replica berada dalam mode recovery dan periksa lag replikasi:
 ```
-docker exec postgres_replica psql -U postgres -c "SELECT pg_is_in_recovery();"
-docker exec postgres_replica psql -U postgres -c "SELECT now() - pg_last_xact_replay_timestamp() AS replication_lag;"
+docker exec postgres_replica psql -U postgres -d $POSTGRES_DB -c "SELECT pg_is_in_recovery();"
+docker exec postgres_replica psql -U postgres -d $POSTGRES_DB -c "SELECT now() - pg_last_xact_replay_timestamp() AS replication_lag;"
+```
+
+Periksa tabel uji yang direplikasi:
+```
+docker exec postgres_replica psql -U postgres -d $POSTGRES_DB -c "SELECT * FROM replication_test;"
 ```
 
 ## Pengujian Replikasi
 
-1. Buat database uji di master:
+1. Tambahkan data uji di master:
    ```
-   docker exec postgres_master psql -U postgres -c "CREATE DATABASE testdb;"
-   ```
-
-2. Buat tabel uji dan masukkan data:
-   ```
-   docker exec postgres_master psql -U postgres -d testdb -c "CREATE TABLE test_table (id SERIAL PRIMARY KEY, name TEXT);"
-   docker exec postgres_master psql -U postgres -d testdb -c "INSERT INTO test_table (name) VALUES ('test1'), ('test2');"
+   docker exec postgres_master psql -U postgres -d $POSTGRES_DB -c "INSERT INTO replication_test (test_name) VALUES ('test from readme');"
    ```
 
-3. Verifikasi bahwa data direplikasi ke replica:
+2. Verifikasi bahwa data direplikasi ke replica:
    ```
-   docker exec postgres_replica psql -U postgres -d testdb -c "SELECT * FROM test_table;"
+   docker exec postgres_replica psql -U postgres -d $POSTGRES_DB -c "SELECT * FROM replication_test;"
    ```
 
 ## Pemecahan Masalah
@@ -142,7 +163,11 @@ docker exec postgres_replica psql -U postgres -c "SELECT now() - pg_last_xact_re
 - **Masalah konektivitas**: Pastikan aturan firewall mengizinkan koneksi pada port PostgreSQL
 - **Masalah slot replikasi**: Periksa apakah slot replikasi ada
   ```
-  docker exec postgres_master psql -U postgres -c "SELECT * FROM pg_replication_slots;"
+  docker exec postgres_master psql -U postgres -d $POSTGRES_DB -c "SELECT * FROM pg_replication_slots;"
+  ```
+- **Masalah database kustom**: Periksa apakah database kustom dibuat
+  ```
+  docker exec postgres_master psql -U postgres -c "\l" | grep $POSTGRES_DB
   ```
 
 ### Masalah Replica
@@ -156,6 +181,10 @@ docker exec postgres_replica psql -U postgres -c "SELECT now() - pg_last_xact_re
   docker logs postgres_replica
   ```
 - **Masalah izin**: Pastikan pg_hba.conf master menyertakan IP replica
+- **Database kustom tidak direplikasi**: Pastikan nama database sama di master dan replica
+  ```
+  docker exec postgres_replica psql -U postgres -c "\l" | grep $POSTGRES_DB
+  ```
 
 ## Pertimbangan Keamanan
 
@@ -167,16 +196,16 @@ docker exec postgres_replica psql -U postgres -c "SELECT now() - pg_last_xact_re
 
 ### Backup
 
-Buat backup rutin dari master:
+Buat backup rutin dari database kustom:
 ```
-docker exec postgres_master pg_dump -U postgres database_anda > backup.sql
+docker exec postgres_master pg_dump -U postgres $POSTGRES_DB > backup.sql
 ```
 
 ### Pemantauan
 
 Pantau lag replikasi secara teratur:
 ```
-docker exec postgres_replica psql -U postgres -c "SELECT now() - pg_last_xact_replay_timestamp() AS replication_lag;"
+docker exec postgres_replica psql -U postgres -d $POSTGRES_DB -c "SELECT now() - pg_last_xact_replay_timestamp() AS replication_lag;"
 ```
 
 ## Konfigurasi Lanjutan
@@ -185,3 +214,20 @@ Untuk pengaturan lanjutan, Anda dapat memodifikasi:
 - Konfigurasi `pg_hba.conf` di kedua skrip
 - Pengaturan jaringan Docker
 - Parameter kinerja PostgreSQL
+- Struktur dan indeks database kustom melalui script migrasi
+
+## Pemulihan Bencana
+
+Untuk mempromosikan replica menjadi master baru jika master utama gagal:
+
+1. Hentikan proses replikasi di replica:
+   ```
+   docker exec postgres_replica psql -U postgres -c "SELECT pg_promote();"
+   ```
+
+2. Pastikan database kustom tersedia dan siap digunakan:
+   ```
+   docker exec postgres_replica psql -U postgres -d $POSTGRES_DB -c "SELECT 1;"
+   ```
+
+3. Konfigurasikan aplikasi Anda untuk menggunakan alamat dan port replica sebagai database utama.

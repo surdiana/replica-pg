@@ -6,6 +6,7 @@ ARCHIVE_PATH=${ARCHIVE_PATH:-./archive}
 DATA_PATH=${DATA_PATH:-./replica_data}
 POSTGRES_USER=${POSTGRES_USER:-postgres}
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+POSTGRES_DB=${POSTGRES_DB:-postgres}  # Added custom database name parameter
 REPLICATION_USER=${REPLICATION_USER:-replica}
 REPLICATION_PASSWORD=${REPLICATION_PASSWORD:-replica}
 POSTGRES_VERSION=${POSTGRES_VERSION:-15}
@@ -29,6 +30,7 @@ echo "====== Initialize PostgreSQL Replica for Cross-Server Replication ======"
 echo "Using the following configuration:"
 echo "Container Name: $CONTAINER_NAME"
 echo "PostgreSQL Version: $POSTGRES_VERSION"
+echo "Database Name: $POSTGRES_DB"  # Added display of database name
 echo "Master Host: $MASTER_HOST"
 echo "Master Port: $MASTER_PORT"
 echo "Archive Path: $ARCHIVE_PATH"
@@ -58,6 +60,24 @@ else
   echo "✓ PostgreSQL master is reachable at $MASTER_HOST:$MASTER_PORT"
 fi
 
+# Test database connectivity to verify custom database exists
+echo "Testing database connectivity to verify custom database exists..."
+if command -v psql >/dev/null 2>&1; then
+  if PGPASSWORD=$POSTGRES_PASSWORD psql -h $MASTER_HOST -p $MASTER_PORT -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT 1" >/dev/null 2>&1; then
+    echo "✓ Successfully connected to database '$POSTGRES_DB' on master"
+  else
+    echo "✗ Could not connect to database '$POSTGRES_DB' on master"
+    echo "Please verify that the database exists and is accessible"
+    echo "You may need to create it first on the master with:"
+    echo "POSTGRES_DB=$POSTGRES_DB ./master_setup.sh"
+    echo ""
+    echo "Continuing anyway, but expect issues..."
+  fi
+else
+  echo "! psql client not found locally, skipping database connectivity test"
+  echo "Installing postgresql-client package is recommended for troubleshooting"
+fi
+
 # Create pg_hba.conf for replica
 echo "Creating pg_hba.conf for PostgreSQL access control..."
 cat > configs/pg_hba.conf << EOF
@@ -67,13 +87,23 @@ local   all             all                                     trust
 host    all             all             127.0.0.1/32            trust
 host    all             all             ::1/128                 trust
 
+# Specific entries for custom database
+local   $POSTGRES_DB    $POSTGRES_USER                          trust
+host    $POSTGRES_DB    $POSTGRES_USER  127.0.0.1/32            trust
+host    $POSTGRES_DB    $POSTGRES_USER  ::1/128                 trust
+
 # Allow connections from master server
 host    all             all             $MASTER_HOST/32         md5
+host    $POSTGRES_DB    $POSTGRES_USER  $MASTER_HOST/32         md5
+host    replication     $REPLICATION_USER $MASTER_HOST/32       md5
 
 # Allow all local network connections
 host    all             all             192.168.0.0/16          md5
+host    $POSTGRES_DB    $POSTGRES_USER  192.168.0.0/16          md5
 host    all             all             10.0.0.0/8              md5
+host    $POSTGRES_DB    $POSTGRES_USER  10.0.0.0/8              md5
 host    all             all             172.16.0.0/12           md5
+host    $POSTGRES_DB    $POSTGRES_USER  172.16.0.0/12           md5
 EOF
 
 # Check if container already exists
@@ -164,11 +194,17 @@ services:
     environment:
       POSTGRES_USER: $POSTGRES_USER
       POSTGRES_PASSWORD: $POSTGRES_PASSWORD
+      POSTGRES_DB: $POSTGRES_DB  # Added custom database name
     network_mode: "host"
     volumes:
       - ${DATA_PATH}:/var/lib/postgresql/data
       - ${ARCHIVE_PATH}:/var/lib/postgresql/archive
     restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
 EOF
 
@@ -178,14 +214,29 @@ docker-compose up -d
 
 # Wait for PostgreSQL to be ready
 echo "Waiting for PostgreSQL replica to be ready..."
-until docker exec $CONTAINER_NAME pg_isready -U $POSTGRES_USER 2>/dev/null; do
-  echo "PostgreSQL is unavailable - sleeping"
-  sleep 1
+max_attempts=30
+attempt=0
+
+while [ $attempt -lt $max_attempts ]; do
+  # Check if PostgreSQL is accepting connections, specifically for our custom database
+  if docker exec $CONTAINER_NAME pg_isready -U $POSTGRES_USER -d $POSTGRES_DB 2>/dev/null; then
+    echo "PostgreSQL replica is up and ready with database $POSTGRES_DB!"
+    break
+  fi
+  
+  attempt=$((attempt+1))
+  echo "PostgreSQL replica is starting up (attempt $attempt of $max_attempts)... waiting"
+  sleep 2
 done
+
+if [ $attempt -eq $max_attempts ]; then
+  echo "Warning: PostgreSQL replica failed to start properly after $max_attempts attempts."
+  echo "Continuing with verification steps, but expect issues..."
+fi
 
 # Verify replica is in recovery mode
 echo "Verifying replica is in recovery mode..."
-RECOVERY_STATUS=$(docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -tAc "SELECT pg_is_in_recovery();" 2>/dev/null || echo "error")
+RECOVERY_STATUS=$(docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -tAc "SELECT pg_is_in_recovery();" 2>/dev/null || echo "error")
 if [ "$RECOVERY_STATUS" == "t" ]; then
   echo "✓ Replica is in recovery mode (streaming replication is active)"
 else
@@ -195,15 +246,30 @@ fi
 
 # Display connection info
 echo "Displaying replication status from replica:"
-docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "SELECT * FROM pg_stat_wal_receiver;"
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT * FROM pg_stat_wal_receiver;"
 
 # Check for replication lag
 echo "Checking for replication lag..."
-docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "SELECT now() - pg_last_xact_replay_timestamp() AS replication_lag;"
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT now() - pg_last_xact_replay_timestamp() AS replication_lag;"
+
+# Verify specifically that custom database exists and is being replicated
+echo "Verifying custom database replication..."
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "\l" | grep "$POSTGRES_DB"
+
+# Check for test table created on master
+echo "Checking for test table created on master..."
+if docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "\dt replication_test" 2>/dev/null | grep -q 'replication_test'; then
+  echo "✓ Test table 'replication_test' found in $POSTGRES_DB database"
+  echo "Showing test data:"
+  docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT * FROM replication_test;"
+else
+  echo "✗ Test table 'replication_test' not found in $POSTGRES_DB database"
+  echo "This could indicate replication issues or that the table wasn't created on master"
+fi
 
 echo "====== PostgreSQL Replica Setup Complete ======"
 echo ""
-echo "To connect to replica: psql -h $SERVER_IP -p $REPLICA_PORT -U $POSTGRES_USER"
+echo "To connect to replica: psql -h $SERVER_IP -p $REPLICA_PORT -U $POSTGRES_USER -d $POSTGRES_DB"
 echo ""
 echo "If replication is not working, try the following:"
 echo "1. Check master server logs: docker logs postgres_master"
@@ -211,3 +277,4 @@ echo "2. Check replica logs: docker logs $CONTAINER_NAME"
 echo "3. Verify network connectivity between servers"
 echo "4. Ensure master's pg_hba.conf allows connections from $SERVER_IP"
 echo "5. Check if the replication slot is active: psql -h $MASTER_HOST -U $POSTGRES_USER -c \"SELECT * FROM pg_replication_slots;\""
+echo "6. Verify the database exists on master: psql -h $MASTER_HOST -U $POSTGRES_USER -c \"\\l\" | grep \"$POSTGRES_DB\""
