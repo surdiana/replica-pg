@@ -182,7 +182,7 @@ max_wal_senders = 10
 max_replication_slots = 10
 hot_standby = on
 archive_mode = on
-archive_command = 'test ! -f ${ARCHIVE_PATH}/%f && cp %p ${ARCHIVE_PATH}/%f || true'
+archive_command = 'test -f %p && cp %p ${ARCHIVE_PATH}/%f || exit 0'
 EOF
 
 # Check if container already exists
@@ -249,7 +249,7 @@ cat >> docker-compose.yml << EOF
         -c "max_replication_slots=10"
         -c "hot_standby=on"
         -c "archive_mode=on"
-        -c "archive_command='test ! -f /var/lib/postgresql/archive/%f && cp %p /var/lib/postgresql/archive/%f || true'"
+        -c "archive_command='test -f %p && cp %p /var/lib/postgresql/archive/%f || exit 0'"
         -c "hba_file=/tmp/pg_hba.conf"
     networks:
       - postgres_network
@@ -295,15 +295,14 @@ fi
 
 # Wait a bit more to ensure PostgreSQL is fully operational
 echo "Giving PostgreSQL a few more seconds to fully initialize..."
-sleep 5
+sleep 10
 
-# Ensure custom database exists before continuing
-echo "Ensuring custom database exists..."
+# Create database if it doesn't exist
+echo "Ensuring database $POSTGRES_DB exists..."
 attempt=0
 max_attempts=5
 
 while [ $attempt -lt $max_attempts ]; do
-  # Pastikan kita menggunakan database default postgres, bukan database kustom yang belum dibuat
   if docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -d postgres -c "SELECT 1 FROM pg_database WHERE datname = '$POSTGRES_DB'" | grep -q 1; then
     echo "✓ Database $POSTGRES_DB exists."
     break
@@ -316,9 +315,19 @@ while [ $attempt -lt $max_attempts ]; do
   fi
   
   attempt=$((attempt+1))
-  echo "Failed to ensure database exists (attempt $attempt of $max_attempts). Retrying in 2 seconds..."
-  sleep 2
+  if [ $attempt -lt $max_attempts ]; then
+    echo "Failed to ensure database exists (attempt $attempt of $max_attempts). Retrying in 3 seconds..."
+    sleep 3
+  fi
 done
+
+if [ $attempt -eq $max_attempts ]; then
+  echo "Warning: Failed to ensure database exists after $max_attempts attempts."
+  echo "PostgreSQL container logs:"
+  docker logs $CONTAINER_NAME --tail 20
+  echo "Trying a different approach to create the database..."
+  docker exec -i $CONTAINER_NAME bash -c "createdb -U $POSTGRES_USER $POSTGRES_DB" || echo "Failed to create database using createdb"
+fi
 
 if [ $attempt -eq $max_attempts ]; then
   echo "Warning: Failed to ensure database exists after $max_attempts attempts."
@@ -333,8 +342,29 @@ echo "Creating replication user..."
 attempt=0
 max_attempts=5
 
+docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -d postgres -c "DROP ROLE IF EXISTS $REPLICATION_USER;" >/dev/null 2>&1 || true
+echo "Removed existing replication user if it existed."
+
 while [ $attempt -lt $max_attempts ]; do
-  if docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -c "CREATE ROLE $REPLICATION_USER WITH REPLICATION PASSWORD '$REPLICATION_PASSWORD' LOGIN;" >/dev/null 2>&1; then
+  if docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -d postgres -c "CREATE ROLE $REPLICATION_USER WITH REPLICATION PASSWORD '$REPLICATION_PASSWORD' LOGIN;" >/dev/null 2>&1; then
+    echo "✓ Replication user created successfully!"
+    break
+  else
+    # Check if the user already exists but might have different permissions
+    if docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -d postgres -c "SELECT 1 FROM pg_roles WHERE rolname='$REPLICATION_USER'" | grep -q 1; then
+      echo "User exists but may need different permissions. Altering role..."
+      docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -d postgres -c "ALTER ROLE $REPLICATION_USER WITH REPLICATION PASSWORD '$REPLICATION_PASSWORD' LOGIN;" >/dev/null 2>&1
+      echo "✓ Replication user updated successfully!"
+      break
+    fi
+  fi
+  
+  attempt=$((attempt+1))
+  if [ $attempt -lt $max_attempts ]; then
+    echo "Failed to create replication user (attempt $attempt of $max_attempts). Retrying in 3 seconds..."
+    sleep 3
+  fi
+done
     echo "Replication user created successfully!"
     break
   else
@@ -348,7 +378,10 @@ if [ $attempt -eq $max_attempts ]; then
   echo "Warning: Failed to create replication user after $max_attempts attempts."
   # Show PostgreSQL logs to help diagnose
   echo "PostgreSQL container logs:"
-  docker logs $CONTAINER_NAME --tail 20
+  docker logs $CONTAINER_NAME --tail 10
+  
+  echo "Checking if user already exists:"
+  docker exec -i $CONTAINER_NAME psql -U $POSTGRES_USER -d postgres -c "SELECT rolname, rolreplication FROM pg_roles WHERE rolname='$REPLICATION_USER';" || true
 fi
 
 # Create replication slot with error handling
@@ -356,19 +389,33 @@ echo "Creating replication slot..."
 attempt=0
 max_attempts=5
 
+# First, drop the slot if it exists
+docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d postgres -c "SELECT pg_drop_replication_slot('replica_slot') FROM pg_replication_slots WHERE slot_name='replica_slot';" >/dev/null 2>&1 || true
+echo "Removed existing replication slot if it existed."
+
 while [ $attempt -lt $max_attempts ]; do
-  if docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -c "SELECT pg_create_physical_replication_slot('replica_slot');" >/dev/null 2>&1; then
+  if docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d postgres -c "SELECT pg_create_physical_replication_slot('replica_slot');" >/dev/null 2>&1; then
     echo "Replication slot created successfully!"
     break
   else
-    attempt=$((attempt+1))
-    echo "Failed to create replication slot (attempt $attempt of $max_attempts). Retrying in 2 seconds..."
-    sleep 2
+    # Check if slot already exists
+    if docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d postgres -c "SELECT 1 FROM pg_replication_slots WHERE slot_name='replica_slot';" | grep -q 1; then
+      echo "✓ Replication slot already exists."
+      break
+    fi
+  fi
+  
+  attempt=$((attempt+1))
+  if [ $attempt -lt $max_attempts ]; then
+    echo "Failed to create replication slot (attempt $attempt of $max_attempts). Retrying in 3 seconds..."
+    sleep 3
   fi
 done
 
 if [ $attempt -eq $max_attempts ]; then
   echo "Warning: Failed to create replication slot after $max_attempts attempts."
+  echo "Checking current replication slots:"
+  docker exec $CONTAINER_NAME psql -U $POSTGRES_USER -d postgres -c "SELECT * FROM pg_replication_slots;" || true
 fi
 
 # Verify configuration - using custom database where appropriate
